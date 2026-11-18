@@ -1,0 +1,37 @@
+v 3
+d 'HMDBIVPOIS': module to fit hidden Markov bivariate Poisson regression with informative dropout
+d
+d hmdbivpois fits the hidden Markov dropout bivariate Poisson model of
+d Carrieri, Gyrd-Hansen and Li Donni (2026, Journal of the Royal Statistical
+d Society Series A) to two counts observed on the same individuals over time
+d when individuals may leave the panel (for example by death) and the dropout
+d is informative. A latent state that follows a first-order Markov chain and
+d a time-constant latent class shift the means of the two counts (bivariate
+d Poisson of the Famoye form) and the logit of the dropout. Estimation is by
+d the EM algorithm with scaled forward-backward recursions, followed by direct
+d maximization if needed. Options: multiple starting values, transitions
+d with covariates, transformations of the lagged counts, current counts in the
+d dropout equation, classes in selected equations, state-specific slopes.
+d Postestimation: predict and estat (ic, transition, ame, survival, fit,
+d lrtrans, stability).
+d
+d KW: hidden Markov
+d KW: latent Markov
+d KW: bivariate Poisson
+d KW: informative dropout
+d KW: count data
+d KW: panel data
+d
+d Requires: Stata version 16
+d
+d Author: Paolo Li Donni
+d Support: https://github.com/plidonni/hmdbivpois
+d
+d Distribution-Date: 20261118
+d
+f hmdbivpois.ado
+f hmdbivpois_p.ado
+f hmdbivpois_estat.ado
+f hmdbivpois.sthlp
+f hmdbivpois_example.dta
+f hmdbivpois_examples.do
