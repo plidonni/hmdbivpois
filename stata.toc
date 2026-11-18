@@ -1,0 +1,5 @@
+v 3
+d Stata package hmdbivpois
+d Paolo Li Donni
+d https://github.com/plidonni/hmdbivpois
+p hmdbivpois Hidden Markov bivariate Poisson regression with informative dropout
