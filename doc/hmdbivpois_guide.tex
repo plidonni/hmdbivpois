@@ -1,0 +1,703 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{mathpazo}
+\usepackage{courier}
+\usepackage{amsmath,amssymb,bm}
+\usepackage{booktabs,array,tabularx}
+\usepackage[margin=2.6cm]{geometry}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{upquote}
+\usepackage[authoryear,round]{natbib}
+\usepackage[colorlinks=true,linkcolor=blue!50!black,citecolor=blue!50!black,urlcolor=blue!50!black]{hyperref}
+
+\lstset{basicstyle=\ttfamily\footnotesize,columns=fullflexible,keepspaces=true,
+  frame=single,framerule=0.3pt,rulecolor=\color{black!30},
+  backgroundcolor=\color{black!3},xleftmargin=0.6em,xrightmargin=0.6em,
+  aboveskip=0.8em,belowskip=0.8em,breaklines=true}
+\newcommand{\cmd}[1]{\texttt{#1}}
+\newcommand{\yv}{\mathbf y}
+\newcommand{\xv}{\mathbf x}
+\newcommand{\wv}{\mathbf w}
+\newcommand{\zv}{\mathbf z}
+\newcommand{\E}{\mathrm E}
+\setlength{\parskip}{0.35em}
+\setlength{\emergencystretch}{3em}
+
+\title{\textbf{hmdbivpois}: hidden Markov bivariate Poisson regression\\ with informative dropout in Stata\\[0.4em]
+\large Technical guide, version 1.0.0}
+\author{Paolo Li Donni\\ University of Palermo\\ \href{mailto:paolo.lidonni@unipa.it}{paolo.lidonni@unipa.it}}
+\date{November 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent This guide documents the model, the estimation method and the postestimation tools of
+\cmd{hmdbivpois}, a Stata command for the hidden Markov dropout bivariate Poisson model of
+\citet{carrieri2026}. The command models two counts observed on the same individuals over time when
+individuals may leave the panel, for example by death, and the dropout is informative. A latent state
+that follows a first-order Markov chain and a time-constant latent class shift the means of the two
+counts, which have a bivariate Poisson distribution of the form of \citet{lakshminarayana1999} and
+\citet{famoye2010}, and the probability of leaving the panel after each period. The dropout is missing
+not at random through the shared latent variables. Estimation is by the EM algorithm with scaled
+forward--backward recursions on the joint chain of classes and states, followed by direct
+maximization when needed. The guide also reports Monte Carlo evidence. The command, its help file and
+an example dataset are available at \url{https://github.com/plidonni/hmdbivpois}.
+\end{abstract}
+
+\tableofcontents
+\bigskip
+
+%=====================================================================
+\section{Introduction}
+%=====================================================================
+
+Panels of health care use often end with death. In the application of \citet{carrieri2026}, about
+30\,000 Danish patients with type-2 diabetes are followed quarterly for five years after an emergency
+admission: outpatient and emergency secondary care are two related counts, and many patients die
+during the follow-up. The patients who leave are those whose use of care was high and rising, so the
+dropout is informative: a model estimated on the survivors, as if the dropout were at random, gives
+biased estimates of the dynamics of care.
+
+\citet{laudicella2022} model two counts with a latent state that follows a Markov chain (time-varying
+unobserved heterogeneity), lagged counts (state dependence) and a bivariate Poisson distribution
+within the state (contemporaneous dependence); \cmd{hmbivpois} implements that model.
+\citet{carrieri2026} add a time-constant latent class, a persistent frailty, and an equation for the
+dropout that shares the latent variables with the counts, in the spirit of the shared-parameter models
+of \citet{bartolucci2015}. \cmd{hmdbivpois} implements this model. Without the dropout equation and with
+one class it reduces to the model of \cmd{hmbivpois}, and gives the same estimates.
+
+Section~\ref{sec:model} presents the model, Section~\ref{sec:estimation} the likelihood and its
+estimation, Section~\ref{sec:post} inference and postestimation, Section~\ref{sec:command} the syntax
+with examples, and Section~\ref{sec:mc} Monte Carlo evidence.
+
+%=====================================================================
+\section{The model}\label{sec:model}
+%=====================================================================
+
+\subsection{Data and notation}
+
+Individuals are indexed by $i=1,\dots,n$ and periods by $t=0,1,\dots,T_i$. In each period we observe two
+counts $\yv_{it}=(y_{1it},y_{2it})$, regressors $\xv_{1it}$, $\xv_{2it}$, $\xv_{dit}$ for the three
+equations and the dropout indicator $D_{it}$, equal to one if the individual leaves the panel after
+period $t$. $D_{it}$ can be one only in the last observed period $T_i$. The first observed period,
+$t=0$, is the \emph{presample period}: it supplies the lagged counts of period~1 and the presample
+counts $\yv_{i0}$ that enter the prior probabilities of the latent variables, and it is not an
+estimation period. The periods of an individual must be consecutive.
+
+An individual is \emph{at risk} of dropout in all the estimation periods except the last one when
+$D_{iT_i}=0$: there the follow-up ends, or the individual is censored, and the dropout is not
+observed. Let $r_{it}$ be the indicator of the periods at risk. The time of the dropout is thus
+interval censored at the length of a period, as in \citet[eq.~6]{carrieri2026}.
+
+Two latent variables describe the unobserved heterogeneity:
+\begin{itemize}
+\item a \emph{class} $C_i\in\{1,\dots,k_1\}$, constant over time (option \cmd{classes()}), a persistent
+frailty;
+\item a \emph{state} $V_{it}\in\{1,\dots,k_2\}$ that follows a first-order Markov chain (option
+\cmd{k()}), a health status that can change over time.
+\end{itemize}
+$C_i$ and $V_{it}$ are independent a priori.
+
+\subsection{Measurement model of the counts}
+
+Given $C_i=u$ and $V_{it}=v$, the conditional means of the two counts are
+\begin{equation}\label{eq:mean}
+\log\mu_{jit}(u,v)=\alpha_{jv}+\delta_{ju}+\xv_{jit}\bm\beta_j+\xv^S_{jit}\bm\beta_{jv}
++\gamma_{j1}\,g(y_{1i,t-1})+\gamma_{j2}\,g(y_{2i,t-1}),\qquad j=1,2,
+\end{equation}
+with $\delta_{j1}=0$. The state intercepts $\alpha_{jv}$ take the place of a constant; the class shifts
+$\delta_{ju}$ add to them, so that classes and states have additive effects on the log means, as in
+\citet{carrieri2026}. $\bm\beta_j$ are the slopes of the regressors, $g(\cdot)$ a transformation of the
+lagged counts (Section~\ref{sec:lags}). The regressors $\xv^S_{jit}$ listed in \cmd{statevary()}, and the
+lags listed in \cmd{lagvary()}, have coefficients that depend on the state (not on the class); they
+are reported in the equations \textit{depvar}\cmd{\_s1}, \dots, \textit{depvar}\cmd{\_s}$k_2$.
+
+Given the latent variables and the lags, the two counts have the bivariate Poisson distribution of
+\citet{lakshminarayana1999} and \citet{famoye2010},
+\begin{equation}\label{eq:famoye}
+p(y_1,y_2)=\frac{\mu_1^{y_1}e^{-\mu_1}}{y_1!}\,\frac{\mu_2^{y_2}e^{-\mu_2}}{y_2!}
+\Big[1+\lambda\,\phi_1(y_1)\,\phi_2(y_2)\Big],
+\qquad \phi_j(y)=e^{-y}-e^{-q\mu_j},\quad q=1-e^{-1}.
+\end{equation}
+The margins are exactly Poisson, because $\E(e^{-Y})=e^{-q\mu}$ for $Y\sim\mathrm{Po}(\mu)$; the
+covariance is $\lambda q^2\mu_1\mu_2e^{-q(\mu_1+\mu_2)}$, with the sign of $\lambda$. The probability is
+nonnegative only if $\lambda$ lies in an interval that depends on the means,
+\begin{equation}\label{eq:range}
+-\frac{1}{\max\{d_1d_2,\,(1-d_1)(1-d_2)\}}\;\le\;\lambda\;\le\;
+\frac{1}{\max\{(1-d_1)d_2,\,d_1(1-d_2)\}},\qquad d_j=e^{-q\mu_j};
+\end{equation}
+the command keeps $\lambda$ in the intersection of these intervals over the observations and the latent
+types, and stores it in \cmd{e(lambda\_range)}.
+
+\subsection{Dropout}
+
+The probability of leaving the panel after period $t$ is a logit with the same latent variables,
+\begin{equation}\label{eq:drop}
+\operatorname{logit}\Pr(D_{it}=1\mid u,v)=\alpha_{dv}+\delta_{du}+\xv_{dit}\bm\beta_d+\xv^S_{dit}\bm\beta_{dv}
++\gamma_{d1}\,g(y_{1i,t-1})+\gamma_{d2}\,g(y_{2i,t-1}),
+\end{equation}
+with $\delta_{d1}=0$. With \cmd{dropcounts(current)} the counts of the period, $g(y_{1it})$ and
+$g(y_{2it})$, which are observed before the dropout, replace the lagged ones; with
+\cmd{dropcounts(both)} both enter. In the application, the counts of the quarter before death capture
+the use of care at the end of life.
+
+\paragraph{Missing not at random.} Given the latent variables, the regressors and the observed counts,
+the dropout does not depend on the counts that would have been observed after it. The dependence of the
+dropout on the unobserved future counts passes entirely through $C_i$ and the sequence of $V_{it}$: the
+model is a shared-parameter model, and the dropout is informative whenever the latent variables shift
+both the counts and the dropout.
+
+\paragraph{Classes in selected equations.} With \cmd{classeq(dropout)} the class shifts of the counts are
+zero, $\delta_{1u}=\delta_{2u}=0$: the class is a frailty that affects only the risk of dropout. With
+\cmd{classeq(counts)}, $\delta_{du}=0$. Both are nested in the default model with the restricted
+parameters inside the parameter space, so a likelihood-ratio test against the default has the usual
+$\chi^2$ distribution, with $2(k_1-1)$ and $k_1-1$ degrees of freedom.
+
+\subsection{Transformations of the lagged counts}\label{sec:lags}
+
+The option \cmd{lagtransform()} sets $g(\cdot)$ for the lags in the three equations, for the counts of
+the period in the dropout equation and for the presample counts in the prior probabilities:
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+Option & $g(y)$\\
+\midrule
+\cmd{linear} (default) & $y$\\
+\cmd{log1p} & $\log(1+y)$\\
+\cmd{logc(\#)} & $\log\max(y,\#)$, $0<\#\le1$\\
+\cmd{logzero} & $\log y$ if $y>0$, $0$ otherwise, plus the indicator $\mathbf 1(y=0)$\\
+\cmd{indicator} & $\mathbf 1(y>0)$\\
+\cmd{topcode(\#)} & $\min(y,\#)$\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+With linear lags and positive own-lag coefficients the conditional mean grows exponentially in the past
+count, and the dynamics can be explosive; the log-type transformations make the model a log-linear
+autoregression in the counts \citep{blundell2002}. \cmd{estat stability} diagnoses both cases.
+
+\subsection{Prior probabilities and transitions}
+
+\paragraph{Classes.} The prior probability of class $u$ is a multinomial logit on the covariates
+$\zv_{i}$ of \cmd{classcov()}, the transformed presample counts and a constant, with class~1 as the base
+(equations \cmd{class2}, \dots).
+
+\paragraph{Initial states.} The probability of state $v$ in the first estimation period is a multinomial
+logit on the covariates of \cmd{initcov()}, the transformed presample counts and a constant, with
+state~1 as the base (equations \cmd{init2}, \dots), following \citet{heckman1981} and
+\citet{wooldridge2005} for the initial conditions.
+
+\paragraph{Transitions.} Each row of the transition matrix of the states is a multinomial logit with
+staying in the state as the base,
+\begin{equation}\label{eq:trans}
+\pi_{b\mid a,it}=\Pr(V_{it}=b\mid V_{i,t-1}=a)=
+\frac{\exp(\tau_{ab}+\wv_{it}\bm\psi_{ab})}{1+\sum_{h\ne a}\exp(\tau_{ah}+\wv_{it}\bm\psi_{ah})},
+\qquad b\ne a,
+\end{equation}
+reported in the equations \cmd{tr}$a$\cmd{\_}$b$: homogeneous by default (no $\wv_{it}$); with covariates
+measured at the period of arrival (\cmd{xtrans()}); with a free matrix for each period of arrival
+(\cmd{tvtrans}); or without transitions (\cmd{notransition}), in which case the states, like the
+classes, are constant. The classes never change, and the transition probabilities do not depend on
+the class.
+
+\subsection{Number of parameters}
+
+With $p_j$ common slopes and $s_j$ state-specific slopes in equation $j\in\{1,2,d\}$, $m_v$ covariates
+of the initial states, $m_u$ of the classes, $L$ features of the presample counts and $r$ covariates of
+the transitions, the model has
+\[
+\begin{split}
+&\sum_{j\in\{1,2,d\}}\big(p_j+k_2+e_j(k_1-1)+k_2s_j\big)+1\\
+&\quad+(k_2-1)(m_v+L+1)+(k_1-1)(m_u+L+1)+k_2(k_2-1)(1+r)
+\end{split}
+\]
+parameters, where $e_j=1$ if the classes shift equation $j$ (\cmd{classeq()}) and the 1 is $\lambda$.
+
+%=====================================================================
+\section{Likelihood and estimation}\label{sec:estimation}
+%=====================================================================
+
+\subsection{The joint chain of classes and states}
+
+Let $f_{it}(u,v)=p(\yv_{it}\mid u,v)\,\big[p_{dit}(u,v)^{D_{it}}\{1-p_{dit}(u,v)\}^{1-D_{it}}\big]^{r_{it}}$
+be the contribution of period $t$ given the latent variables, with $p_{dit}$ from \eqref{eq:drop}. The
+likelihood of individual $i$ is
+\begin{equation}
+L_i=\sum_{u=1}^{k_1}\Pr(C_i=u)\sum_{v_1,\dots,v_{T_i}}\Pr(V_{i1}=v_1)\,f_{i1}(u,v_1)
+\prod_{t=2}^{T_i}\pi_{v_t\mid v_{t-1},it}\,f_{it}(u,v_t),
+\qquad\ell(\bm\vartheta)=\sum_{i=1}^n\log L_i.
+\end{equation}
+The command treats the pair $(C_i,V_{it})$ as a single Markov chain on $K=k_1k_2$ \emph{latent types},
+$s=(u-1)k_2+v$, with initial probabilities $\Pr(C_i=u)\Pr(V_{i1}=v)$ and the block-diagonal transition
+matrix $\mathbf I_{k_1}\otimes\bm\Pi$: the class never changes. This is equivalent to the recursions by
+class of \citet{carrieri2026} and lets the likelihood be computed by the forward recursion of hidden
+Markov models \citep{baum1970,zucchini2016} on the joint chain. The recursion is scaled at each period to
+avoid underflow, and vectorized over individuals, who are sorted by decreasing $T_i$, so that the
+unbalanced panels created by the dropout need no special treatment. The cost grows with $k_1^2k_2^2$,
+which is negligible for the small numbers of classes used in practice.
+
+The intercepts of the types are linear in those of the model: in each equation the vector of the $K$
+intercepts is $\mathbf C\,(\alpha_1,\dots,\alpha_{k_2},\delta_2,\dots,\delta_{k_1})'$, and the
+state-specific slopes of type $s$ are those of its state.
+
+\subsection{The EM algorithm}\label{sec:em}
+
+Estimation follows the EM algorithm \citep{dempster1977} as adapted to latent Markov models by
+\citet{bartolucci2013}.
+
+\paragraph{E-step.} The forward--backward recursions on the joint chain give the posterior probabilities
+of the types in each period and the expected numbers of transitions between types. The posterior of the
+class is the sum over the states, that of the initial state the sum over the classes, and the expected
+transitions of the states are the sums of the diagonal blocks over the classes.
+
+\paragraph{M-step.}
+\begin{itemize}
+\item \emph{Counts:} the weighted bivariate Poisson regression \eqref{eq:mean}--\eqref{eq:famoye} with
+the posterior weights of the types, updated by Newton steps with step halving and analytic second
+derivatives. The gradient and the Hessian are accumulated over the types for the expanded parameters
+(common slopes, $K$ intercepts, $K$ sets of state-specific slopes, $\lambda$) and mapped to the
+parameters of the model through the linear map of the intercepts. Every trial point keeps $\lambda$
+inside the interval \eqref{eq:range}.
+\item \emph{Dropout:} the weighted logit \eqref{eq:drop} on the periods at risk, by Newton steps with step
+halving, with the same mapping.
+\item \emph{Initial states and classes:} fractional multinomial logits on the posterior probabilities.
+\item \emph{Transitions:} the closed form $\hat\pi_{b\mid a}\propto$ expected number of transitions from
+$a$ to $b$ for the homogeneous chain; with \cmd{xtrans()} or \cmd{tvtrans}, a weighted multinomial logit
+for each state of origin.
+\end{itemize}
+The algorithm stops when the relative change of the log likelihood falls below \cmd{emtolerance()}
+(default $10^{-8}$) or after \cmd{emiterate()} iterations (default 500).
+
+\paragraph{Direct maximization.} If the EM has not converged, or if \cmd{technique()} is specified, the
+log likelihood is maximized directly with the analytic score, computed by the Fisher identity at the
+cost of one forward--backward pass. Near a flat maximum the EM can stop slightly short of it (in the
+simulations, by about 0.01 in log likelihood); \cmd{technique(nr)} refines the estimates.
+
+\paragraph{Starting values.} The slopes start from Poisson regressions of the two counts and from a logit
+of the dropout on the periods at risk. The state intercepts of the counts are spread around the
+constant, those of the dropout are equal; the class shifts start small for the counts and spread for
+the dropout; the prior logits start from zero and the chain from a persistent matrix with staying
+probability 0.9. Starting values can be given with \cmd{from()}.
+
+\paragraph{Multiple starting values.} The likelihood of a finite mixture can have local maxima, and
+\citet{carrieri2026} use several starting points. With \cmd{starts(\#)} the EM is run from the default
+starting values and from $\#-1$ random ones, for \cmd{startiterate()} iterations each (by default to
+convergence), and goes on from the one with the largest log likelihood. The random starting values keep
+the slopes, set $\lambda=0$, draw the intercepts of the states around the mean intercept, the class
+shifts, the constants of the prior logits and transition matrices with staying probabilities between
+0.6 and 0.95. \cmd{e(ll\_starts)} reports the log likelihood reached from each start, and
+\cmd{e(n\_best)} the number of starts within 0.1 of the best.
+
+\paragraph{Labelling.} After estimation the states are ordered by increasing intercept of the first count
+equation (\cmd{sortby(eq1)}) or of the second (\cmd{sortby(eq2)}), and the classes by increasing shift
+of the dropout, so that class~1 has the lowest risk of dropout. The relabelling permutes all the
+parameters and does not change the likelihood.
+
+\subsection{Variance}
+
+The default variance is the inverse of the observed information, computed by central differences of the
+analytic score \citep{mclachlan2000}. A $\lambda$ on a bound of its interval is held fixed
+(\cmd{e(n\_bound)}). \cmd{vce(robust)} gives the sandwich estimator clustered on the individuals.
+
+%=====================================================================
+\section{Inference and postestimation}\label{sec:post}
+%=====================================================================
+
+\subsection{Number of states and classes}
+
+\cmd{estat ic} reports AIC and two versions of BIC: with $\log n$, $n$ the number of individuals
+(\cmd{e(bic)}, the usual choice in latent Markov models, \citealp{bartolucci2013}), and with $\log N$,
+$N$ the number of person-periods (\cmd{e(bic\_N)}, the convention of Table~3 of \citealp{carrieri2026}).
+It also reports the relative entropy of the classification, separately for the states and for the
+classes. In applications, fit the model for a grid of $k_1$ and $k_2$, compare the BIC, and check the
+size of the smallest state and class.
+
+\subsection{Transitions and test of no transitions}
+
+\cmd{estat transition} reports the transition matrix of the states, the expected durations
+$1/(1-\pi_{a\mid a})$, the mean initial probabilities of the states and the prior probabilities of the
+classes, with delta-method standard errors.
+
+\cmd{estat lrtrans} tests $H_0$: $\pi_{b\mid a}=0$ for all $b\ne a$, the model where the states, like the
+classes, are constant. $H_0$ lies on the boundary of the parameter space, and following
+\citet{bartolucci2006} the likelihood-ratio statistic has a chi-bar-squared distribution, a mixture of
+$\chi^2_j$, $j=0,\dots,k_2(k_2-1)$, with weights $\omega_j$ equal to the probability that the projection
+of a $N(\mathbf 0,\mathbf I^{-1})$ vector onto the nonnegative orthant has $j$ positive components, where
+$\mathbf I$ is the information on the off-diagonal transition probabilities net of the other parameters
+at the restricted estimates. On the joint chain the derivative with respect to $\pi_{b\mid a}$ is the sum
+over the classes of the derivatives with respect to the corresponding elements of the diagonal blocks.
+$\mathbf I$ is estimated by the outer product of the individual scores and the weights by \cmd{reps()}
+simulated projections \citep{lawson1974}. The restricted model is fitted from two sets of starting
+values. The $p$-value of the $\chi^2_{k_2(k_2-1)}$ distribution, an upper bound, is also reported.
+
+No score test is reported. The individual scores of the transition probabilities at $\bm\Pi=\mathbf I$
+are sums of likelihood ratios $f_{it}(u,b)/f_{it}(u,a)$, whose distribution has very heavy tails: in one
+sample, the outer product of the scores is far from the information, and a statistic
+$\mathbf s'\,\widehat{\mathbf I}^{-1}\mathbf s$ is badly calibrated (Section~\ref{sec:mc}). The weights
+of the chi-bar-squared depend only on the shape of $\widehat{\mathbf I}$, and the LR test keeps its
+size.
+
+\subsection{Predictions}
+
+\cmd{predict} computes statistics that average over the latent types with one of four sets of
+probabilities: posterior (given all the outcomes of the individual, the default), filtered (up to the
+period), one-step-ahead (up to the period before) and prior (given the covariates and the presample
+counts); \cmd{instate()} and \cmd{inclass()} fix one latent variable. The outcomes of a period are the two
+counts and, in the periods at risk, the dropout. The statistics are the expected counts \cmd{mu1},
+\cmd{mu2}; the probability of dropout \cmd{pdrop}; the probabilities of the states \cmd{postprob} and of
+the classes \cmd{classprob}; the most likely state \cmd{state} and class \cmd{class}; the state of each
+period in the most likely sequence of class and states \cmd{viterbi} \citep{viterbi1967}; the
+within-type correlation \cmd{rho}; and the probability of a pair of counts \cmd{pr(}$a,b$\cmd{)}.
+
+\subsection{Marginal effects, survival and fit}
+
+\cmd{estat ame} reports average marginal effects on $\E(y_1)$, $\E(y_2)$ and $\Pr(D=1)$ with the
+probabilities of the latent types held fixed,
+\[
+\mathrm{AME}=\frac1N\sum_{i,t}\sum_{s}\Pr(\text{type } s\mid\cdot)\,
+\frac{m_{it}(s;A)-m_{it}(s;B)}{\Delta},
+\]
+with $m$ the expected count or the probability of dropout and $A$, $B$ two counterfactual designs: the
+regressor shifted by $\pm h$ ($\Delta=2h$), a level and the base level of a factor variable
+($\Delta=1$), one more lagged count ($\Delta=1$, through $g$) or, with \cmd{dropcounts()}, one more
+count of the period in the dropout equation. State-specific slopes enter in each type. Standard errors
+are by the delta method.
+
+\cmd{estat survival} compares the Kaplan--Meier survival by period of follow-up with the survival
+predicted by the model, $\prod_r(1-\bar h_r)$, with $\bar h_r$ the mean predicted probability of dropout
+among the individuals at risk in period $r$ (Fig.~8 of \citealp{carrieri2026}). The default weights are
+one-step-ahead, given the counts and the survival up to the period before; prior weights ignore the
+selection of the survivors.
+
+\cmd{estat fit} compares the observed distribution of each count with the distribution predicted in each
+state (or class) and with their mixture (Tables~5--6 and Fig.~7 of \citealp{carrieri2026}), with the
+Pearson statistic, the dissimilarity index and the largest cell difference.
+
+\subsection{Stability of the dynamics}
+
+\cmd{estat stability} checks whether the dynamics of the lagged counts can explode. It reports by latent
+type the coefficients of the lags; with log-type lags the spectral radius of the $2\times2$ matrix of the
+coefficients of $g(y_1)$ and $g(y_2)$ in the count equations, which must be below one; with linear lags
+the index $\gamma_{jj}\exp(a)$ of the map $y\mapsto\exp(a+\gamma_{jj}y)$, with $a$ the 99th percentile of
+the rest of the linear predictor, which must not exceed $e^{-1}$; the share of deterministic paths,
+from every observation and in every type, whose expected count exceeds \cmd{limit()} within
+\cmd{horizon()} periods; and the same share for simulated paths of the model from the last observed
+period, with the type drawn from its posterior probabilities, together with the mean probability of
+still being in the panel at the horizon.
+
+%=====================================================================
+\section{The command}\label{sec:command}
+%=====================================================================
+
+\subsection{Syntax}
+
+\begin{lstlisting}
+hmdbivpois (depvar1 = [indepvars1] [, eqopts]) (depvar2 = [indepvars2] [, eqopts])
+           [(dropvar = [indepvarsd] [, eqopts])] [if] [in], id(varname) time(varname) k(#) [options]
+\end{lstlisting}
+
+The data are in long form, one observation per individual and period. \textit{indepvars},
+\cmd{statevary()} and \cmd{xtrans()} may contain factor variables. Without the dropout equation the
+command fits the model of \cmd{hmbivpois} with classes.
+
+\begin{center}
+\small
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+Option & Description\\
+\midrule
+\multicolumn{2}{l}{\emph{Equation options}}\\
+\cmd{statevary(}\textit{varlist}\cmd{)} & regressors with state-specific coefficients\\
+\cmd{lagvary(}\textit{depvars}\cmd{)} & lagged counts with state-specific coefficients\\
+\midrule
+\multicolumn{2}{l}{\emph{Model}}\\
+\cmd{id()}, \cmd{time()}, \cmd{k(\#)} & individual, integer period, number of states (required)\\
+\cmd{classes(\#)} & number of classes (default 1)\\
+\cmd{initcov(}\textit{varlist}\cmd{)}, \cmd{classcov(}\textit{varlist}\cmd{)} & covariates of the initial states and of the classes\\
+\cmd{lagtransform(}\textit{g}\cmd{)} & transformation of the lagged counts\\
+\cmd{dropcounts(lag|current|both)} & counts in the dropout equation\\
+\cmd{classeq(all|dropout|counts)} & equations shifted by the classes\\
+\midrule
+\multicolumn{2}{l}{\emph{Transitions}}\\
+\cmd{xtrans(}\textit{varlist}\cmd{)}, \cmd{tvtrans}, \cmd{notransition} & covariates, free by period, none\\
+\midrule
+\multicolumn{2}{l}{\emph{Estimation and reporting}}\\
+\cmd{starts(\#)}, \cmd{startiterate(\#)}, \cmd{startseed(\#)} & multiple starting values\\
+\cmd{emiterate(\#)}, \cmd{emtolerance(\#)}, \cmd{emonly} & control of the EM\\
+\cmd{technique()}, \cmd{iterate(\#)} & direct maximization\\
+\cmd{from(}\textit{matname}\cmd{)} & starting values, in the order of \cmd{e(b)}\\
+\cmd{sortby(eq1|eq2|none)} & labelling of the states\\
+\cmd{vce(oim|robust)}, \cmd{level(\#)}, \cmd{nolog} & variance and display\\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+Postestimation:
+\begin{lstlisting}
+predict [type] newvar | stub* [if] [in] [, mu1 mu2 pdrop postprob classprob state class viterbi
+        rho pr(a,b) filtered onestep prior instate(#) inclass(#)]
+estat ic [, n(#)]
+estat transition [, period(#) level(#)]
+estat ame [, prior onestep filtered instate(#) inclass(#) level(#)]
+estat survival [, over(varname) onestep prior filtered posterior]
+estat fit [, max(#) classes posterior onestep prior filtered]
+estat lrtrans [, reps(#) seed(#)]
+estat stability [, horizon(#) limit(#) nsim(#) seed(#)]
+\end{lstlisting}
+The stored results are listed in \cmd{help hmdbivpois}.
+
+\subsection{Installation}
+
+\begin{lstlisting}
+net install hmdbivpois, from("https://raw.githubusercontent.com/plidonni/hmdbivpois/main/") replace
+net get hmdbivpois, from("https://raw.githubusercontent.com/plidonni/hmdbivpois/main/") replace
+\end{lstlisting}
+The first command installs the command and its help file; the second downloads into the current folder
+the example dataset \cmd{hmdbivpois\_example.dta} and the do-file \cmd{hmdbivpois\_examples.do}, which
+runs all the examples below. Stata 16 or later is required.
+
+\subsection{Examples}
+
+The example dataset is simulated from the model with $n=2000$ individuals, a presample period and up to
+$T=6$ estimation periods, $k_2=3$ states, $k_1=2$ classes and homogeneous transitions, with the true
+values of Table~\ref{tab:true}. A large share of the individuals leave the panel before the end of the
+follow-up, most of them in class~2, which has the higher risk of dropout. The variables \cmd{state} and \cmd{class} hold the true latent
+variables.
+
+\begin{table}[h]
+\centering\footnotesize
+\caption{True parameters of the example dataset}\label{tab:true}
+\begin{tabular}{ll}
+\toprule
+Block & Values\\
+\midrule
+Equation $y_1$ & $x_{11}=0.4$, $x_{12}=-0.3$, $\gamma_{11}=0.03$, $\gamma_{12}=-0.05$, $\alpha_{1}=(-0.3,\,0.7,\,1.5)$, $\delta_{12}=0.3$\\
+Equation $y_2$ & $x_{21}=0.3$, $x_{22}=-0.4$, $\gamma_{21}=-0.10$, $\gamma_{22}=0.10$, $\alpha_{2}=(-2.5,\,-1.5,\,-0.6)$, $\delta_{22}=0.4$\\
+Dependence & $\lambda=-0.5$\\
+Dropout & $x_d=0.5$, $\gamma_{d1}=0.05$, $\gamma_{d2}=0.30$, $\alpha_d=(-4.2,\,-3.7,\,-3.2)$, $\delta_{d2}=1.5$\\
+Initial states (2, 3) & $z_1=(0.5,1.0)$, $y_{1,0}=(0.15,0.30)$, $y_{2,0}=(0.30,0.50)$, constant $=(-0.5,-2.0)$\\
+Class 2 & $z_u=0.8$, $y_{1,0}=0.1$, $y_{2,0}=0.4$, constant $=-1.0$\\
+Transitions & $\bm\Pi=\begin{pmatrix}0.85&0.12&0.03\\0.08&0.84&0.08\\0.03&0.12&0.85\end{pmatrix}$\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\medskip\noindent\textbf{Base model.}\par\nopagebreak
+\begin{lstlisting}
+use hmdbivpois_example, clear
+hmdbivpois (y1 = x11 x12) (y2 = x21 x22) (died = xd), id(id) time(time) ///
+    k(3) classes(2) initcov(z1) classcov(zu)
+\end{lstlisting}
+The output reports, for each equation, the slopes, the lag coefficients, the state intercepts
+(\cmd{state1}, \dots) and the class shift (\cmd{class2}), then $\lambda$, the dropout equation, the
+initial logits (\cmd{init2}, \cmd{init3}), the transition logits (\cmd{tr1\_2}, \dots) and the class logit
+(\cmd{class2}), followed by the transition matrix and the shares of the states and classes.
+
+\medskip\noindent\textbf{Postestimation.}\par\nopagebreak
+\begin{lstlisting}
+estat ic
+estat transition
+estat ame
+estat survival
+estat fit
+predict double pd, pdrop
+predict s_hat, viterbi
+predict c_hat, class
+tabulate state s_hat if time > 0
+tabulate class c_hat if time > 0
+estat lrtrans
+\end{lstlisting}
+
+\medskip\noindent\textbf{Choice of the number of states and classes.}\par\nopagebreak
+\begin{lstlisting}
+forvalues c = 1/2 {
+    forvalues k = 2/3 {
+        quietly hmdbivpois (y1 = x11 x12) (y2 = x21 x22) (died = xd), ///
+            id(id) time(time) k(`k') classes(`c') initcov(z1) classcov(zu) nolog
+        display "classes `c'  k `k'  BIC " %10.2f e(bic)
+    }
+}
+\end{lstlisting}
+
+\medskip\noindent\textbf{Dropout ignored.} Without the third equation the dropout is treated as missing at
+random, and the estimates are those of \cmd{hmbivpois}; the comparison shows the bias that the
+informative dropout induces.
+\begin{lstlisting}
+hmdbivpois (y1 = x11 x12) (y2 = x21 x22), id(id) time(time) k(3) initcov(z1)
+\end{lstlisting}
+
+\medskip\noindent\textbf{Extensions.}\par\nopagebreak
+\begin{lstlisting}
+hmdbivpois (y1 = x11 x12) (y2 = x21 x22) (died = xd), id(id) time(time) ///
+    k(3) classes(2) initcov(z1) classcov(zu) starts(5)
+matrix list e(ll_starts)
+
+quietly hmdbivpois (y1 = x11 x12) (y2 = x21 x22) (died = xd), id(id) time(time) ///
+    k(3) classes(2) initcov(z1) classcov(zu) nolog
+estimates store all
+quietly hmdbivpois (y1 = x11 x12) (y2 = x21 x22) (died = xd), id(id) time(time) ///
+    k(3) classes(2) initcov(z1) classcov(zu) classeq(dropout) nolog
+lrtest all ., df(2)
+
+hmdbivpois (y1 = x11 x12, statevary(x11)) (y2 = x21 x22) (died = xd), id(id) time(time) ///
+    k(3) classes(2) initcov(z1) classcov(zu) dropcounts(both) lagtransform(log1p)
+estat stability
+\end{lstlisting}
+The last specification lets the slope of $x_{11}$ differ across states, puts the counts of the period in
+the dropout equation and transforms the lags by $\log(1+y)$; it is misspecified for the example data and
+only illustrates the syntax. Give the degrees of freedom to \cmd{lrtest} with \cmd{df()}: it takes them
+from \cmd{e(rank)}, which drops when some parameters are weakly identified.
+
+\paragraph{Practical advice.}
+\begin{itemize}
+\item Choose $k_2$ and $k_1$ with the BIC and check the size of the smallest state and class.
+\item Use \cmd{starts()} for the final specification; when \cmd{e(n\_best)} is one, add starts. In the
+simulations local maxima appeared only in overparameterized models.
+\item With classes in the dropout equation only, the classes are identified by at most one dropout per
+individual and the dropout parameters can be imprecise; a longer follow-up helps.
+\item A $\lambda$ on a bound (\cmd{e(n\_bound)}$>0$) signals stronger dependence than the Famoye form
+allows.
+\item With linear lags and large counts, run \cmd{estat stability} or use a log-type
+\cmd{lagtransform()}.
+\end{itemize}
+
+%=====================================================================
+\section{Monte Carlo evidence}\label{sec:mc}
+%=====================================================================
+
+The command was tested with simulation experiments with $n=4000$ individuals, a presample period, $T=8$
+estimation periods, $k_2=3$ states and $k_1=2$ classes, using the design of Table~\ref{tab:true} (with
+about 43\% of dropout) and the changes listed in Table~\ref{tab:mc}. Each experiment has 100
+replications. The table reports the ratio between the Monte Carlo standard deviation of the estimates
+and the mean estimated standard error, and the coverage of the nominal 95\% confidence intervals, as
+ranges over the parameters (or the marginal effects).
+
+\begin{table}[h]
+\centering\small
+\caption{Monte Carlo results ($n=4000$, $T=8$, $k_2=3$, $k_1=2$, 100 replications)}\label{tab:mc}
+\begin{tabularx}{\textwidth}{>{\raggedright\arraybackslash}p{5.6cm}XX}
+\toprule
+Design & MC s.d./mean s.e.: mean [min, max] & Coverage of 95\% CI [min, max]\\
+\midrule
+Base model (42 parameters) & 0.999 [0.844, 1.139] & [0.90, 1.00]\\
+Average marginal effects (\cmd{estat ame}) & 1.009 [0.795, 1.158] & [0.91, 0.99]\\
+Transitions on covariates (\cmd{xtrans()}, 54 parameters) & 1.007 [0.861, 1.160] & [0.89, 0.99]\\
+$\log(1+y)$ lags (\cmd{lagtransform(log1p)}) & 0.997 [0.810, 1.096] & [0.91, 0.99]\\
+Counts of the period in the dropout, classes in the dropout only$^a$ & 0.997 [0.642, 1.355] & [0.89, 0.99]\\
+State-specific slopes in the three equations & 0.990 [0.817, 1.169] & [0.89, 0.99]\\
+\bottomrule
+\end{tabularx}
+
+\smallskip
+\begin{minipage}{\textwidth}\footnotesize
+$^a$ Excluding the state intercepts and the class shift of the dropout equation, which have heavy-tailed
+sampling distributions in this design (Monte Carlo s.d.\ 1.7--1.8, coverage 0.87--0.99): a few
+replications put the probability of dropout of class~2 close to one.
+\end{minipage}
+\end{table}
+
+\paragraph{Consistency checks.} Without the dropout equation and with one class, \cmd{hmdbivpois} and
+\cmd{hmbivpois} give the same log likelihood, coefficients and variances (differences below $10^{-11}$),
+also with transitions on covariates, every transformation of the lags and state-specific slopes. Nested
+models evaluated at the restricted estimates reproduce the restricted log likelihood exactly
+(\cmd{notransition}, \cmd{classeq()}, \cmd{statevary()}). With \cmd{dropcounts(both)} the estimates
+equal those of the default model with the counts of the period written as regressors of the dropout.
+Predictions, marginal effects in a given type and the stability diagnostics equal closed-form
+computations; the Kaplan--Meier curve of \cmd{estat survival} equals the one computed directly, and the
+model tracks it within about one percentage point.
+
+\paragraph{Test of no transitions.} With data generated without transitions, the rejection rates of
+\cmd{estat lrtrans} at the 10\%, 5\% and 1\% levels were 0.06, 0.05 and 0.02 with the chi-bar-squared
+distribution, against 0.02, 0.01 and 0.00 with the $\chi^2_6$ bound. A score (Kuhn--Tucker) statistic
+based on the outer product of the scores rejected in 0.01, 0.01 and 0.00 of the samples, and, at the true
+parameters, its unprojected version had mean 44 instead of 6: it is not reported.
+
+\paragraph{Local maxima.} In 20 samples of the base design, the best of 10 starts exceeded the default
+start by at most 0.03 in log likelihood, and on average 8.6 of the 10 starts reached the best maximum. In
+a model with more latent types than the data ($k_2=4$, $k_1=3$) the 10 starts ended at log likelihoods
+spread over 30 points: there \cmd{starts()} matters.
+
+%=====================================================================
+\section*{Citation}
+%=====================================================================
+If you use \cmd{hmdbivpois}, please cite \citet{carrieri2026} and
+
+\smallskip
+\noindent Li Donni, P. 2026. hmdbivpois: Stata module to fit hidden Markov bivariate Poisson regression
+with informative dropout. \url{https://github.com/plidonni/hmdbivpois}.
+
+\begin{thebibliography}{99}
+\bibitem[Bartolucci(2006)]{bartolucci2006}
+Bartolucci, F. 2006. Likelihood inference for a class of latent Markov models under linear hypotheses on
+the transition probabilities. \textit{Journal of the Royal Statistical Society, Series B} 68: 155--178.
+
+\bibitem[Bartolucci and Farcomeni(2015)]{bartolucci2015}
+Bartolucci, F., and A. Farcomeni. 2015. A discrete time event-history approach to informative drop-out in
+mixed latent Markov models with covariates. \textit{Biometrics} 71: 80--89.
+
+\bibitem[Bartolucci et~al.(2013)]{bartolucci2013}
+Bartolucci, F., A. Farcomeni, and F. Pennoni. 2013. \textit{Latent Markov Models for Longitudinal Data}.
+Boca Raton, FL: Chapman \& Hall/CRC.
+
+\bibitem[Baum et~al.(1970)]{baum1970}
+Baum, L. E., T. Petrie, G. Soules, and N. Weiss. 1970. A maximization technique occurring in the
+statistical analysis of probabilistic functions of Markov chains. \textit{Annals of Mathematical
+Statistics} 41: 164--171.
+
+\bibitem[Blundell et~al.(2002)]{blundell2002}
+Blundell, R., R. Griffith, and F. Windmeijer. 2002. Individual effects and dynamics in count data
+models. \textit{Journal of Econometrics} 108: 113--131.
+
+\bibitem[Carrieri et~al.(2026)]{carrieri2026}
+Carrieri, V., D. Gyrd-Hansen, and P. Li Donni. 2026. Dynamic healthcare demand with informative dropout:
+evidence from register data. \textit{Journal of the Royal Statistical Society Series A}.
+\url{https://doi.org/10.1093/jrsssa/qnag108}.
+
+\bibitem[Dempster et~al.(1977)]{dempster1977}
+Dempster, A. P., N. M. Laird, and D. B. Rubin. 1977. Maximum likelihood from incomplete data via the EM
+algorithm. \textit{Journal of the Royal Statistical Society, Series B} 39: 1--38.
+
+\bibitem[Famoye(2010)]{famoye2010}
+Famoye, F. 2010. On the bivariate negative binomial regression model. \textit{Journal of Applied
+Statistics} 37: 969--981.
+
+\bibitem[Heckman(1981)]{heckman1981}
+Heckman, J. J. 1981. The incidental parameters problem and the problem of initial conditions in
+estimating a discrete time--discrete data stochastic process. In \textit{Structural Analysis of
+Discrete Data with Econometric Applications}, ed. C. F. Manski and D. McFadden, 179--195. Cambridge, MA:
+MIT Press.
+
+\bibitem[Lakshminarayana et~al.(1999)]{lakshminarayana1999}
+Lakshminarayana, J., S. N. N. Pandit, and K. Srinivasa Rao. 1999. On a bivariate Poisson distribution.
+\textit{Communications in Statistics -- Theory and Methods} 28: 267--276.
+
+\bibitem[Laudicella and Li Donni(2022)]{laudicella2022}
+Laudicella, M., and P. Li Donni. 2022. The dynamic interdependence in the demand of primary and emergency
+secondary care: A hidden Markov approach. \textit{Journal of Applied Econometrics} 37: 521--536.
+
+\bibitem[Lawson and Hanson(1974)]{lawson1974}
+Lawson, C. L., and R. J. Hanson. 1974. \textit{Solving Least Squares Problems}. Englewood Cliffs, NJ:
+Prentice-Hall.
+
+\bibitem[McLachlan and Peel(2000)]{mclachlan2000}
+McLachlan, G., and D. Peel. 2000. \textit{Finite Mixture Models}. New York: Wiley.
+
+\bibitem[Viterbi(1967)]{viterbi1967}
+Viterbi, A. J. 1967. Error bounds for convolutional codes and an asymptotically optimum decoding
+algorithm. \textit{IEEE Transactions on Information Theory} 13: 260--269.
+
+\bibitem[Wooldridge(2005)]{wooldridge2005}
+Wooldridge, J. M. 2005. Simple solutions to the initial conditions problem in dynamic, nonlinear panel
+data models with unobserved heterogeneity. \textit{Journal of Applied Econometrics} 20: 39--54.
+
+\bibitem[Zucchini et~al.(2016)]{zucchini2016}
+Zucchini, W., I. L. MacDonald, and R. Langrock. 2016. \textit{Hidden Markov Models for Time Series: An
+Introduction Using R}. 2nd ed. Boca Raton, FL: Chapman \& Hall/CRC.
+\end{thebibliography}
+
+\end{document}
